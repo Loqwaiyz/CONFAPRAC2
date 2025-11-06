@@ -1,117 +1,176 @@
 import argparse
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Set, Tuple
 
-# --- 1. Модель данных репозитория Alpine Linux (Имитация APKINDEX) ---
-# Каждая запись имитирует ключевые поля из метаданных пакета, 
-# где 'depends' соответствует полю D: (Dependencies) в APKINDEX.
-# Зависимости перечислены в формате 'имя_пакета' или 'имя_пакета>=версия'.
-# Мы будем брать только 'имя_пакета', игнорируя условия версий (>=, <, ~).
-
+# --- Модель данных репозитория Alpine Linux (Имитация APKINDEX для remote) ---
+# Ключи: имя пакета, Значения: список прямых зависимостей.
 MOCK_REPOSITORY: Dict[str, List[str]] = {
-    # Пакет 'busybox' имеет 3 прямые зависимости (virtual, musl, libcrypto).
     "busybox": ["musl", "alpine-baselayout", "libcrypto1.1"],
-    
-    # Пакет 'python3' зависит от busybox, openssl, и libc.
     "python3": ["busybox", "libssl1.1", "zlib", "libffi"],
-    
-    # Пакет 'openssl' зависит от libc и libcrypto.
     "openssl": ["libcrypto1.1", "musl"],
-    
-    # 'musl' и 'alpine-baselayout' - базовые пакеты без других зависимостей.
     "musl": [],
     "libcrypto1.1": [],
     "zlib": [],
     "libffi": [],
     "alpine-baselayout": [],
-    
-    # Несуществующий пакет для проверки ошибки
-    "non-existent-pkg": [] 
 }
+# -----------------------------------------------------------------------------
 
-# -----------------------------------------------------------------------
-
-def extract_dependencies(package_name: str, repository: Dict[str, List[str]]) -> Optional[List[str]]:
+def load_local_repository(file_path: str) -> Dict[str, List[str]]:
     """
-    Имитирует извлечение прямых зависимостей для заданного пакета 
-    из смоделированного репозитория.
+    4. Поддержка тестового режима: Загружает граф зависимостей из простого 
+    локального текстового файла.
+    Формат файла: PACKAGE: DEP1, DEP2, ... (где PACKAGE - заглавные буквы)
+    """
+    repo = {}
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                if ':' in line:
+                    package, deps_str = line.split(':', 1)
+                    package = package.strip()
+                    # Разбиваем строку зависимостей, игнорируя пустые элементы
+                    deps = [d.strip() for d in deps_str.split(',') if d.strip()]
+                    repo[package] = deps
+    except FileNotFoundError:
+        print(f"Ошибка: Файл тестового репозитория не найден по пути: {file_path}")
+        return {} 
+    except Exception as e:
+        print(f"Ошибка при чтении файла тестового репозитория: {e}")
+        return {}
+    
+    return repo
 
-    Args:
-        package_name: Имя пакета для анализа.
-        repository: Смоделированная структура данных репозитория.
+def build_dependency_graph_bfs(
+    start_package: str, 
+    repository_data: Dict[str, List[str]], 
+    filter_substring: str
+) -> Tuple[Set[str], List[Tuple[str, str]], List[str]]:
+    """
+    1. Получение графа зависимостей реализовать алгоритмом BFS без рекурсии.
+    Строит полный граф зависимостей, обрабатывая транзитивность, фильтры и циклы.
 
     Returns:
-        Список прямых зависимостей или None, если пакет не найден.
+        Кортеж: (Множество всех узлов, Список всех ребер, Список обнаруженных циклов)
     """
     
-    # Нормализуем имя, чтобы оно соответствовало ключам (без условий версий)
-    # В реальном APKTOOLS, зависимости могут быть в формате 'pkgname>=version'.
-    # Здесь мы упрощаем:
-    normalized_name = package_name.split('>=')[0].split('<')[0].split('~')[0]
-    
-    # 2. Извлечь информацию о прямых зависимостях заданного пользователем пакета.
-    # Реальная логика: загрузить и распарсить APKINDEX с repository_url.
-    # Прототип: ищем в MOCK_REPOSITORY.
-    
-    dependencies_with_versions = repository.get(normalized_name)
-    
-    if dependencies_with_versions is None:
-        return None # Пакет не найден в репозитории
-    
-    # В APKINDEX зависимости могут содержать условия версий (e.g., 'musl>=1.2.3')
-    # Для построения графа нам нужно только имя.
-    direct_dependencies = []
-    for dep in dependencies_with_versions:
-        # Убираем все условия версий ('zlib', а не 'zlib>=1.2.3')
-        # Для простоты прототипа просто берем первую часть до первого не-алфавитного символа, 
-        # или до конца строки, если условия нет.
-        name = dep.split('<')[0].split('>')[0].split('=')[0].split('~')[0].strip()
-        direct_dependencies.append(name)
-        
-    return direct_dependencies
+    all_packages: Set[str] = set()
+    all_edges: List[Tuple[str, str]] = []
+    # Очередь для BFS. Хранит только те пакеты, которые нужно обработать.
+    queue: List[str] = [start_package]
+    # Множество для отслеживания УЖЕ ДОБАВЛЕННЫХ В ГРАФ пакетов (посещенных узлов).
+    visited: Set[str] = set() 
+    cycles_detected: List[str] = []
 
+    # 2. Проверка начального пакета на фильтр
+    if filter_substring and filter_substring in start_package:
+        return set(), [], [f"Начальный пакет '{start_package}' отфильтрован."]
+    
+    visited.add(start_package)
+    all_packages.add(start_package)
+
+    # Главный цикл BFS
+    while queue:
+        current_package = queue.pop(0)
+
+        # Прямые зависимости. Если пакет не найден, возвращаем пустой список.
+        direct_deps = repository_data.get(current_package, [])
+
+        for dep in direct_deps:
+            # 2. Не учитывать при анализе пакеты, имя которых содержит заданную подстроку.
+            if filter_substring and filter_substring in dep:
+                print(f"   [FILTERED] Зависимость '{dep}' отфильтрована (содержит '{filter_substring}').")
+                continue # Пропускаем эту ветвь
+                
+            # Добавляем ребро в граф, даже если dep уже посещен.
+            all_edges.append((current_package, dep))
+            all_packages.add(dep)
+            
+            # 3. Корректно обработать случаи наличия циклических зависимостей.
+            if dep in visited:
+                # Обнаружен путь к уже пройденному узлу. 
+                # Это означает либо цикл, либо общий предок (DAG). 
+                # Для целей демонстрации сообщаем о найденном обратном ребре, 
+                # но не обрабатываем его как ошибку BFS.
+                if dep in all_packages: # dep уже был обнаружен
+                    cycles_detected.append(f"Обратное ребро/Цикл обнаружен: {current_package} -> {dep}")
+                continue # Не добавляем в очередь повторно (BFS без рекурсии)
+            
+            # Если пакет новый и не отфильтрован:
+            visited.add(dep)
+            queue.append(dep)
+            
+    return all_packages, all_edges, cycles_detected
 
 def run_visualizer(package_name: str, repository_url: str, repository_mode: str, output_filename: str, filter_substring: str):
     """
-    Основная логика приложения.
+    Основная логика приложения: загрузка, обход BFS и вывод.
     """
     
-    print("--- Конфигурация инструмента визуализации графа зависимостей ---")
+    # Этап 1: Вывод конфигурации
+    print("--- Конфигурация инструмента визуализации графа зависимостей (Этап 3) ---")
     print(f"Имя анализируемого пакета: **{package_name}**")
     print(f"URL/Путь репозитория: **{repository_url}**")
     print(f"Режим работы с репозиторием: **{repository_mode}**")
     print(f"Имя выходного файла графа: **{output_filename}**")
-    print(f"Подстрока для фильтрации пакетов: **{filter_substring}**")
-    print("------------------------------------------------------------------\n")
+    print(f"Подстрока для фильтрации пакетов: **'{filter_substring}'**")
+    print("--------------------------------------------------------------------------\n")
     
     # --- Сбор данных (Этап 2) ---
+    repository_data: Dict[str, List[str]] = {}
     
-    print(f"Запрос зависимостей для пакета: **{package_name}**...")
-    
-    # 
-    # В реальном приложении здесь будет логика загрузки 
-    # APKINDEX.tar.gz с repository_url, распаковка и парсинг.
-    # Для прототипа используем MOCK_REPOSITORY.
-    #
-    
-    dependencies = extract_dependencies(package_name, MOCK_REPOSITORY)
-    
-    if dependencies is None:
-        print(f"Ошибка: Пакет '{package_name}' не найден в смоделированном репозитории.")
+    if repository_mode == 'remote':
+        repository_data = MOCK_REPOSITORY
+        print("Используется **удаленный (remote)** режим со смоделированным репозиторием APK.")
+    else: # repository_mode == 'local' (тестирование)
+        print(f"Используется **тестовый (local)** режим, загрузка графа из файла: **{repository_url}**")
+        repository_data = load_local_repository(repository_url)
+        if not repository_data:
+            print("Невозможно продолжить: Тестовый репозиторий пуст или не найден.")
+            return
+
+    if package_name not in repository_data:
+        print(f"Ошибка: Начальный пакет '{package_name}' не найден в выбранном репозитории.")
         return
+
+    # --- Основные операции (Этап 3) ---
+    print(f"\nЗапуск BFS-обхода зависимостей для пакета **{package_name}**...")
     
-    # 3. (только для этого этапа) Вывести на экран все прямые зависимости.
-    print(f"Прямые зависимости '{package_name}' найдены:")
-    if dependencies:
-        for dep in dependencies:
-            print(f"- **{dep}**")
+    nodes, edges, cycles = build_dependency_graph_bfs(
+        package_name,
+        repository_data,
+        filter_substring
+    )
+    
+    print("\n--- Результаты построения графа ---")
+    
+    if filter_substring:
+        print(f"Фильтрация: пакеты, содержащие **'{filter_substring}'**, исключены из дальнейшего обхода.")
+
+    if cycles:
+        print("\n**Обнаружены циклические зависимости (или обратные ребра):**")
+        for cycle in cycles:
+            print(f"   - {cycle}")
     else:
-        print("- **Нет прямых зависимостей** (базовый пакет).")
+        print("\nЦиклические зависимости не обнаружены (в рамках обхода).")
+        
+    print("\n**Все обнаруженные пакеты (узлы) в графе:**")
+    print(", ".join(sorted(nodes)) if nodes else "Нет пакетов (возможно, начальный пакет отфильтрован)")
+
+    print("\n**Все обнаруженные зависимости (ребра) в графе:**")
+    for source, target in edges:
+        print(f"   - {source} -> {target}")
+
+    print(f"\n(Этап 4) Граф будет сохранен в файл: **{output_filename}**")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Инструмент визуализации графа зависимостей для пакетного менеджера (Прототип, Этап 2).",
+        description="Инструмент визуализации графа зависимостей для пакетного менеджера (Прототип, Этап 3).",
         formatter_class=argparse.RawTextHelpFormatter
     )
 
@@ -128,7 +187,7 @@ def main():
         type=str, 
         default='https://dl-cdn.alpinelinux.org/alpine/v3.18/main', 
         dest='repository_url',
-        help='URL-адрес репозитория (по умолчанию: Alpine v3.18/main).'
+        help='URL репозитория (remote) или путь к файлу графа (local, по умолчанию: Alpine v3.18/main).'
     )
 
     parser.add_argument(
@@ -136,7 +195,7 @@ def main():
         choices=['remote', 'local'], 
         default='remote', 
         dest='repository_mode',
-        help='Режим работы с тестовым репозиторием (remote/local, по умолчанию: remote).'
+        help='Режим работы: "remote" (имитация APK) или "local" (тестовый файл, по умолчанию: remote).'
     )
 
     parser.add_argument(
@@ -152,13 +211,11 @@ def main():
         type=str, 
         default='', 
         dest='filter_substring',
-        help='Подстрока для фильтрации пакетов.'
+        help='Подстрока для фильтрации пакетов (пакеты, содержащие ее, исключаются).'
     )
 
     args = parser.parse_args()
 
-    # В целях демонстрации этапа, мы передаем только имя пакета 
-    # для получения зависимостей из заглушки MOCK_REPOSITORY
     run_visualizer(
         args.package_name,
         args.repository_url,
