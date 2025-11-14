@@ -1,0 +1,1 @@
+python gitmanagerdemo5stage.py -p A -m local -r test_repo.txt -o my_graph.png
